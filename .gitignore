@@ -1,0 +1,5 @@
+*
+!.gitignore
+!face_auth.py
+!main.py
+!spotify_controller.py
