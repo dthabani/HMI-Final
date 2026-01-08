@@ -2,21 +2,19 @@ import cv2
 import time
 import math
 import queue
-import random
-import threading
+import math
 import queue
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+import threading
 import numpy as np
-from deepface import DeepFace
-from spotify_controller import SpotifyController
+import mediapipe as mp
 from face_auth import FaceAuth
-from PIL import Image, ImageDraw, ImageFont
 import speech_recognition as sr
-import random
-from collections import deque
-import sys
+from mediapipe.tasks import python
+from gemini_parser import GeminiParser
+from mediapipe.tasks.python import vision
+from emotion_manager import EmotionManager
+from PIL import Image, ImageDraw, ImageFont
+from spotify_controller import SpotifyController
 
 # Configuration
 WIDTH, HEIGHT = 1280, 720
@@ -104,6 +102,7 @@ class SpotifyWorker(threading.Thread):
         self.sp = None
         self.connected = False
         self.display_name = "Connecting..."
+        self.volume = 50 # Default start
 
     def run(self):
         try:
@@ -126,20 +125,84 @@ class SpotifyWorker(threading.Thread):
                     vol = task['value']
                     print(f"Setting volume to {vol}%") # Feedback
                     self.sp.set_volume(vol)
+                    self.volume = vol # Sync State
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", f"Setting volume to {vol} percent"])
+                    except: pass
                 elif cmd_type == 'search':
                     q = task['query']
-                    print(f"Searching Spotify for: {q}") # Feedback
+                    # Feedback
+                    # print(f"Searching Spotify for: {q}")
                     res = self.sp.search_and_play(q, task.get('search_type', 'playlist'), task.get('randomize', False))
-                    if res: print(f"Playing: {res}")
+                    if res: 
+                        print(f"Playing: {res}")
+                        # TTS Feedback (Async)
+                        try:
+                            import subprocess
+                            # macOS 'say' command
+                            text = f"Playing {res}"
+                            subprocess.Popen(["say", text])
+                        except Exception as e:
+                            print(f"TTS Error: {e}")
+                    else:
+                        print("Spotify: No results found.")
                 elif cmd_type == 'play_pause':
                     print("Toggling Play/Pause")
                     self.sp.play_pause_track()
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", "Toggling playback"])
+                    except: pass
                 elif cmd_type == 'next':
                     print("Skipping to Next Track")
                     self.sp.next_track()
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", "Playing next track"])
+                    except: pass
                 elif cmd_type == 'prev':
                     print("Going to Previous Track")
                     self.sp.previous_track()
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", "Playing previous track"])
+                    except: pass
+                elif cmd_type == 'shuffle':
+                    print(f"Setting Shuffle: {task['state']}")
+                    self.sp.toggle_shuffle(task['state'])
+                    try: 
+                        import subprocess
+                        status = "on" if task['state'] else "off"
+                        subprocess.Popen(["say", f"Shuffle is now {status}"])
+                    except: pass
+                elif cmd_type == 'transfer':
+                    print(f"Transferring Playback to: {task['device']}")
+                    self.sp.transfer_playback(task['device'])
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", f"Transferring playback to {task['device']}"])
+                    except: pass
+                elif cmd_type == 'queue':
+                    print(f"Adding URI to Queue: {task['uri']}")
+                    self.sp.add_to_queue(task['uri'])
+                    try: 
+                        import subprocess
+                        subprocess.Popen(["say", "Added to queue"])
+                    except: pass
+                elif cmd_type == 'seek':
+                    print(f"Seeking to: {task['position']}ms")
+                    self.sp.seek_track(task['position'])
+                    try: 
+                        import subprocess
+                        # Convert ms back to seconds for speech
+                        sec = int(task['position'] / 1000)
+                        subprocess.Popen(["say", f"Seeking to {sec} seconds"])
+                    except: pass
+                elif cmd_type == 'search_queue':
+                    q = task['query']
+                    print(f"Searching to Queue: {q}")
+                    self.sp.search_and_queue(q)
 
             except queue.Empty: continue
             except Exception as e: print(f"Worker Error: {e}")
@@ -150,6 +213,14 @@ class SpotifyWorker(threading.Thread):
     def play_pause(self): self.cmd_queue.put({'type': 'play_pause'})
     def next_track(self): self.cmd_queue.put({'type': 'next'})
     def prev_track(self): self.cmd_queue.put({'type': 'prev'})
+    
+    # New Advanced Controls
+    def toggle_shuffle(self, state): self.cmd_queue.put({'type': 'shuffle', 'state': state})
+    def transfer_playback(self, device): self.cmd_queue.put({'type': 'transfer', 'device': device})
+    def add_to_queue(self, uri): self.cmd_queue.put({'type': 'queue', 'uri': uri})
+    def seek_track(self, ms): self.cmd_queue.put({'type': 'seek', 'position': ms})
+    def search_queue(self, query): self.cmd_queue.put({'type': 'search_queue', 'query': query})
+    
     def stop(self): self.running = False
 
 # Voice Thread
@@ -187,6 +258,14 @@ class VoiceThread(threading.Thread):
             self.status = "Voice: LOCKED"
 
     def run(self):
+        # Initialize Gemini Parser
+
+        try:
+            parser = GeminiParser()
+        except:
+            parser = None
+            print("Gemini Parser Init Failed - Fallback to regex")
+
         while self.running:
             if self.listening and self.access_granted:
                 try:
@@ -206,22 +285,159 @@ class VoiceThread(threading.Thread):
                     
                     self.status = "Processing..."
                     command = self.recognizer.recognize_google(audio).lower()
-                    print(f"Voice heard: {command}") # Terminal
-                    self.status = f"Heard: {command}" # UI
                     
-                    if "play" in command:
-                        query = command.replace("play", "").strip()
-                        moods = ["sad", "happy", "focus", "party", "chill"]
-                        found_mood = next((m for m in moods if m in query), None)
+                    # Feedback: What was heard
+                    print(f"Voice heard: {command}")
+                    
+                    # Auto-Disable Voice
+                    self.listening = False
+                    print("Voice control DISABLED") 
+                    self.status = f"Heard: {command}" 
+                    
+                    # GEMINI INTEGRATION
+                    parsed = None
+                    if parser:
+                        self.status = "Voice: Asking Gemini..."
+                        parsed = parser.parse_command(command)
+                    
+                    if parsed and parsed.get('intent'):
+                        intent = parsed['intent']
+                        # Feedback: Gemini Intent
+                        print(f"Gemini Intent: {intent}")
+                        self.status = f"Intent: {intent}"
                         
-                        if " by " in query or not found_mood:
-                            print(f"Interpreted command: Play Track '{query}'")
-                            self.spotify_worker.search_track(query)
-                        elif found_mood:
-                            variations = ["songs", "music", "vibes", "hits", "mix"]
-                            full_query = f"{found_mood} {random.choice(variations)}"
-                            print(f"Interpreted command: Play Mood Playlist '{full_query}'")
-                            self.spotify_worker.search_playlist(full_query)
+                        if intent == "PLAY_SONG":
+                            q = parsed.get('search_query') or f"{parsed.get('song')} {parsed.get('artist')}"
+                            # Feedback: Searching
+                            print(f"Searching Spotify for: Track '{q}'")
+                            self.status = f"Searching: {q}"
+                            self.spotify_worker.search_track(q)
+                            
+                        elif intent == "PLAY_PLAYLIST" or intent == "PLAY_GENRE_OR_VIBE":
+                            q = parsed.get('search_query') or parsed.get('playlist')
+                            # Feedback: Searching
+                            print(f"Searching Spotify for: Playlist '{q}'")
+                            self.status = f"Searching: {q}"
+                            self.spotify_worker.search_playlist(q)
+
+                        elif intent == "PLAY_ARTIST":
+                            artist = parsed.get('artist') or parsed.get('search_query')
+                            # Feedback: Searching
+                            print(f"Searching Spotify for: Artist '{artist}'")
+                            self.status = f"Searching: {artist}"
+                            self.spotify_worker.search_track(f"artist:{artist}") 
+
+                        elif intent == "PLAY_RADIO":
+                            q = parsed.get('search_query')
+                            # Feedback: Searching
+                            print(f"Searching Spotify for: Radio '{q}'")
+                            self.status = f"Searching: {q}"
+                            self.spotify_worker.search_playlist(f"{q}")
+                            
+                        elif intent == "PAUSE" or intent == "RESUME":
+                            print("Executing: Play/Pause")
+                            self.status = "Exec: Play/Pause"
+                            self.spotify_worker.play_pause()
+                        
+                        elif intent == "NEXT_TRACK":
+                            print("Executing: Next Track")
+                            self.status = "Exec: Next Track"
+                            self.spotify_worker.next_track()
+                        
+                        elif intent == "PREVIOUS_TRACK":
+                            print("Executing: Previous Track")
+                            self.status = "Exec: Prev Track"
+                            self.spotify_worker.prev_track()
+                        
+                        elif intent == "SET_VOLUME":
+                            vol = parsed.get('volume')
+                            if vol is not None: 
+                                print(f"Executing: Set Volume to {vol}%")
+                                self.status = f"Vol: {vol}%"
+                                self.spotify_worker.set_volume(vol)
+                        
+                        elif intent == "SHUFFLE_ON":
+                            print("Executing: Shuffle ON")
+                            self.status = "Shuffle: ON"
+                            self.spotify_worker.toggle_shuffle(True)
+                            
+                        elif intent == "SHUFFLE_OFF":
+                            print("Executing: Shuffle OFF")
+                            self.status = "Shuffle: OFF"
+                            self.spotify_worker.toggle_shuffle(False)
+                        
+                        elif intent == "TRANSFER_PLAYBACK":
+                            dev = parsed.get('device_name')
+                            if dev:
+                                print(f"Executing: Transfer to '{dev}'")
+                                self.status = f"Transfer: {dev}"
+                                self.spotify_worker.transfer_playback(dev)
+
+                        elif intent == "ADD_TO_QUEUE":
+                            # We need to search for the URI first
+                            q = parsed.get('search_query') or f"{parsed.get('song')} {parsed.get('artist')}"
+                            if q:
+                                print(f"Queueing: Finding '{q}'...")
+                                # Note: This requires a helper or creating a 'search_and_queue' in worker
+                                # Let's implement a 'search_queue' in worker.
+                                self.spotify_worker.cmd_queue.put({'type': 'search_queue', 'query': q})
+                                self.status = f"Queueing: {q}"
+
+                        elif intent == "SEEK_TO_POSITION":
+                            secs = parsed.get('timestamp_seconds')
+                            if secs is not None:
+                                ms = int(secs * 1000)
+                                print(f"Executing: Jump to {secs}s")
+                                self.status = f"Seek: {secs}s"
+                                self.spotify_worker.seek_track(ms)
+                            
+                        else:
+                            print(f"Unknown Intent: {intent}")
+                            self.status = "Voice: Unknown Intent"
+
+                    else:
+                        # FALLBACK LOGIC (Deterministic)
+                        
+                        # Advanced playback controls that require Gemini
+                        ADVANCED_KEYWORDS = [
+                            "shuffle", "queue", "add to", "transfer", "play on", 
+                            "jump to", "seek", "skip", "next", "previous", "back", 
+                            "pause", "resume", "stop", "volume", "turn up", "turn down"
+                            ]
+
+                        if any(keyword in command for keyword in ADVANCED_KEYWORDS):
+                            msg = f"Cannot execute {command}. Advanced controls require Gemini connection."
+                            print(f"Voice: {msg}")
+                            self.status = "Voice: CMD Not Supported"
+                            # TTS Feedback
+                            try:
+                                import subprocess
+                                subprocess.Popen(["say", msg])
+                            except: pass
+
+                        # Playlist Search
+                        elif "playlist" in command:
+                            query = command.split("playlist", 1)[1].strip()
+                            if query:
+                                print(f"Fallback: Searching Playlist '{query}'")
+                                self.status = f"FB: Playlist {query}"
+                                self.spotify_worker.search_playlist(query)
+
+                        # Song Search
+                        elif "song" in command:
+                            query = command.split("song", 1)[1].strip()
+                            if query:
+                                print(f"Fallback: Searching Track '{query}'")
+                                self.status = f"FB: Track {query}"
+                                self.spotify_worker.search_track(query)
+
+                        # Default Play
+                        elif "play" in command:
+                            query = command.split("play", 1)[1].strip()
+                            if query:
+                                print(f"Fallback: Searching Track '{query}'")
+                                self.status = f"FB: Track {query}"
+                                self.spotify_worker.search_track(query)
                     
                     time.sleep(1)
                     if self.listening: self.status = "Voice: LISTENING..."
@@ -236,49 +452,13 @@ class VoiceThread(threading.Thread):
             else: time.sleep(0.5)
     def stop(self): self.running = False
 
-
-# Emotion Thread (Voting)
-class EmotionThread(threading.Thread):
-    def __init__(self):
-        super().__init__()
-        self.frame = None
-        self.running = True
-        self.detected_emotion = "neutral"
-        self.emotion_buffer = deque(maxlen=EMOTION_BUFFER_SIZE)
-        self.lock = threading.Lock()
-
-    def update_frame(self, frame):
-        with self.lock: self.frame = frame.copy()
-
-    def run(self):
-        while self.running:
-            frame_to_process = None
-            with self.lock:
-                if self.frame is not None: frame_to_process = self.frame
-            
-            if frame_to_process is not None:
-                try:
-                    objs = DeepFace.analyze(img_path=frame_to_process, actions=['emotion'], 
-                                        enforce_detection=False, detector_backend='opencv', silent=True)
-                    if objs:
-                        self.emotion_buffer.append(objs[0]['dominant_emotion'])
-                        from collections import Counter
-                        most_common = Counter(self.emotion_buffer).most_common(1)
-                        if most_common:
-                            new_emo = most_common[0][0]
-                            if new_emo != self.detected_emotion:
-                                self.detected_emotion = new_emo
-                                # print(f"Detected mood: {new_emo}") # Optional logging
-                except Exception: pass
-            time.sleep(EMOTION_CHECK_INTERVAL)
-    def stop(self): self.running = False
-
+# Emotion Thread Logic moved to emotion_manager.py
 
 def main():
-    # 1. SYSTEM INITIALIZATION
+    # System Initialization
     print("Initializing System...")
     spotify_worker = SpotifyWorker(); spotify_worker.start()
-    emotion_thread = EmotionThread(); emotion_thread.start()
+    emotion_manager = EmotionManager()
     voice_thread = VoiceThread(spotify_worker); voice_thread.start()
     
     face_auth = FaceAuth() # Load model
@@ -296,7 +476,7 @@ def main():
     cap = cv2.VideoCapture(0)
     cap.set(3, WIDTH); cap.set(4, HEIGHT)
 
-    # 2. LONG-TERM STATE (Persists across frames)
+    # Long-Term State (Persists across frames)
     # Application Modes
     MODE_MAIN = 0
     MODE_MENU = 1
@@ -306,13 +486,13 @@ def main():
     app_mode = MODE_MAIN
     
     # Timers & Counters
-    left_hand_timer = 0
-    right_hand_active = False 
-
+    right_hand_timer = 0
+    
     last_action_time = 0
     last_auth_time = 0
     last_voice_toggle_time = 0
     last_gesture_time = 0
+    last_playlist_search_time = 0
     last_vol_change_time = 0
     
     # FPS State
@@ -341,15 +521,14 @@ def main():
     print("System Ready. Press 'q' to quit. Press 'r' to Open Menu.")
 
     while True:
-        # 3. INPUT PHASE
+        # Input Phase
         success, img = cap.read()
         if not success: break
         
         img = cv2.flip(img, 1)
         current_time = time.time()
         
-        # 4. FRAME STATE INITIALIZATION
-        found_left = False
+        # Frame State Initialization
         found_right = False
         volume_update_val = None
         system_status = "Idle"
@@ -357,7 +536,7 @@ def main():
         hand_landmarks_list = []
         handedness_list = []
 
-        # FPS SMOOTHING
+        # FPS Smoothing
         latency_ms_inst = int((current_time - p_time) * 1000)
         if current_time - last_fps_update_time > 0.5:
             # Calculate momentary FPS
@@ -367,12 +546,12 @@ def main():
             last_fps_update_time = current_time
         p_time = current_time
 
-        # 5. STATE MACHINE LOGIC
+        # State Machine Logic
         
-        # MODE: MAIN 
+        # MODE: MAIN (Normal Operation)
         if app_mode == MODE_MAIN:
             
-            # GLOBAL UPDATES
+            # Global Updates (Auth, Busy)
             if is_busy and (current_time - last_action_time > 15.0):
                 is_busy = False
                 print("System auto-unlocked (timeout)")
@@ -384,7 +563,7 @@ def main():
                     print("Authentication expired.")
                     access_granted = False
                 
-                # Predict Face
+                # Predict Face (Non-blocking)
                 user, conf = face_auth.predict(img)
                 if user != "Unknown" and user != "No Face":
                     if current_user != user: print(f"User authenticated: {user}")
@@ -402,9 +581,9 @@ def main():
             elif is_busy: system_status = "Busy..."
             elif voice_thread.listening: system_status = "Listening"
             
-            # DETECTION
+            # Detection
             if access_granted:
-                emotion_thread.update_frame(img)
+
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
                 detection_result = detector.detect_for_video(mp_image, int(current_time * 1000))
@@ -422,6 +601,11 @@ def main():
                 
                 for idx, hand_lms in enumerate(hand_landmarks_list):
                     label = hand_labels[idx]
+                    
+                    # IGNORE LEFT HAND
+                    if label == "Left":
+                        continue
+
                     h, w, c = img.shape
                     lm_list = []
                     for id, lm in enumerate(hand_lms):
@@ -442,61 +626,79 @@ def main():
                         tx, ty = lm_list[4][1], lm_list[4][2]
                         ipx, ipy = lm_list[3][1], lm_list[3][2]
                         thumb_open = math.hypot(tx - wrist_x, ty - wrist_y) > math.hypot(ipx - wrist_x, ipy - wrist_y) * 1.1
-                        is_palm_open = all(fingers_open) and thumb_open
+                        
+                        # REMOVED: is_palm_open logic (Playback)
+                        # REMOVED: Pinch logic (Volume)
+
                         is_peace = fingers_open[0] and fingers_open[1] and not fingers_open[2] and not fingers_open[3]
                         
-                        # Pinch
-                        px1, py1 = lm_list[4][1], lm_list[4][2]; px2, py2 = lm_list[8][1], lm_list[8][2]
-                        pinch_dist = math.hypot(px2 - px1, py2 - py1)
-
                         # Triggers
-                        if is_palm_open:
-                            gesture_hold_active = True
-                            if (current_time - last_gesture_time > 5.0):
-                                if "Left" in hand_labels and "Right" in hand_labels:
-                                    system_status = "Play/Pause"
-                                    spotify_worker.play_pause()
-                                    last_action_time = current_time; last_gesture_time = current_time
-                                elif label == "Right":
-                                    system_status = "Skipping..."
-                                    spotify_worker.next_track()
-                                    last_action_time = current_time; last_gesture_time = current_time
-                                elif label == "Left":
-                                    system_status = "Previous..."
-                                    spotify_worker.prev_track()
-                                    last_action_time = current_time; last_gesture_time = current_time
+                        # Trigger: Thumb Open AND Fingers Closed (Thumbs Up)
+                        is_thumbs_up = thumb_open and not fingers_open[1] and not fingers_open[2] and not fingers_open[3]
+                        
+                        if is_thumbs_up:
+                            # Debounce/Hold logic
+                            right_hand_timer += 1
+                            found_right = True # Visual feedback
+                            
+                            if right_hand_timer > 30: # Hold for ~1 sec
+                                is_busy = True
+                                print("Analyzing Mood...")
+                                system_status = "Reading Mood..."
+                                
+                                # Show feedback before freezing for inference
+                                cv2.putText(img, "Reading Mood...", (WIDTH//2 - 100, HEIGHT//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+                                cv2.imshow("Spotify Gesture Control", img)
+                                cv2.waitKey(1)
+                                
+                                # ONE-SHOT INFERENCE
+                                detected_mood = emotion_manager.detect_emotion(img)
+                                
+                                if detected_mood:
+                                    print(f"Mood Detected: {detected_mood}")
+                                    system_status = f"Mood: {detected_mood}"
+                                    
+                                    # Auto-Disable Mood Search
+                                    print("Mood search DISABLED")
+                                    is_thumbs_up = False 
+                                    
+                                    # Send to Gemini for creative search query
+                                    smart_query = ""
+                                    try:
+                                        parser = GeminiParser()
+                                        gemini_result = parser.generate_search_query_from_mood(detected_mood)
+                                        
+                                        if gemini_result:
+                                            smart_query = gemini_result
+                                            print(f"Gemini suggests: '{smart_query}' for mood '{detected_mood}'")
+                                        else:
+                                            # Clean Fallback
+                                            print("INFO:GeminiParser:Gemini failed or returned null. Using fallback logic.")
+                                            smart_query = f"{detected_mood} mood songs" # Default fallback
+                                            
+                                    except Exception:
+                                        print("INFO:GeminiParser:Gemini failed or returned null. Using fallback logic.")
+                                        smart_query = f"{detected_mood} mood songs" # Default fallback
+
+                                    # Send to Spotify
+                                    spotify_worker.search_playlist(smart_query)
+                                else:
+                                    print("Mood detection failed.")
+                                    system_status = "Mood Failed"
+                                
+                                last_action_time = current_time
+                                is_busy = False
+                                right_hand_timer = 0
+                        
                         elif is_peace:
                             if current_time - last_voice_toggle_time > 2.0:
                                 voice_thread.toggle_listening()
                                 last_voice_toggle_time = current_time
-                        elif label == "Left" and pinch_dist < 40:
-                            left_hand_timer += 1
-                            found_left = True
-                            if left_hand_timer > 20: # ~0.8s hold
-                                is_busy = True
-                                s_emo = emotion_thread.detected_emotion
-                                q = f"melodic rap" if s_emo == "neutral" else f"{s_emo} songs"
-                                system_status = f"Searching: {q}"
-                                spotify_worker.search_playlist(q)
-                                last_action_time = current_time; is_busy = False; left_hand_timer = 0
-                        # 3. VOLUME
-                        elif label == "Right":
-                            is_vol_mode = not fingers_open[2] and not fingers_open[3]
-                            
-                            if is_vol_mode:
-                                found_right = True
-                                
-                                target_vol = np.interp(pinch_dist, [20, 170], [0, 100])
-                                
-                                current_vol = int(0.7 * current_vol + 0.3 * target_vol)
-                                volume_update_val = current_vol
-                                
-                                if current_time - last_vol_change_time > 0.1:
-                                    spotify_worker.set_volume(current_vol)
-                                    last_vol_change_time = current_time
-                        if not found_left: left_hand_timer = 0
+                        
+                        if not is_thumbs_up: right_hand_timer = 0
+                        # REMOVED: Left hand timer logic
 
-            # RENDER MAIN
+            # Render Main
             # Landmarks
             if results:
                 for hand_lms in hand_landmarks_list: draw_landmarks_manual(img, hand_lms)
@@ -504,12 +706,12 @@ def main():
             # Status Bar
             cv2.rectangle(img, (0, 0), (WIDTH, 50), (20, 20, 20), cv2.FILLED)
             
-            # 1. Status
+            # Status
             status_c = COLOR_ACTIVE if access_granted else COLOR_DENIED
             if is_busy: status_c = (255, 255, 0)
             img = draw_text_pil(img, f"Status: {system_status}", (20, 15), size=20, color=status_c)
 
-            # 2. Right Side Info Group
+            # Right Side Info Group
             # Latency
             img = draw_text_pil(img, f"Lat: {latency_display}ms", (WIDTH - 250, 15), size=18, color=COLOR_TEXT)
             
@@ -520,23 +722,33 @@ def main():
                 # User
                 img = draw_text_pil(img, f"User: {current_user}", (WIDTH - 550, 15), size=18, color=COLOR_GENERIC_TEXT if 'COLOR_GENERIC_TEXT' in globals() else COLOR_TEXT)
                 # Mood
-                emo = emotion_thread.detected_emotion.upper()
-                img = draw_text_pil(img, f"Mood: {emo}", (WIDTH - 400, 15), size=18, color=COLOR_ACCENT)
+                mood_text = "Mood: Idle"
+                mood_color = (128, 0, 128) # Purple (Idle)
+                
+                if system_status == "Reading Mood...":
+                    mood_text = "Mood: DETECTING..."
+                    mood_color = (0, 255, 255) # Yellow
+                elif "Mood:" in system_status: 
+                    mood_text = system_status 
+                    mood_color = (255, 0, 255) # Magenta/Purple (Active)
+                
+                img = draw_text_pil(img, mood_text, (WIDTH - 400, 15), size=18, color=mood_color)
             
-            # Volume Bar
+            # Volume Bar 
+            # Sync volume from Worker
+            current_vol = spotify_worker.volume
+
             bar_x = 30; bar_y_start=150; bar_y_end=500
             vol_bar_h = np.interp(current_vol, [0, 100], [bar_y_end, bar_y_start])
-            c_bar = COLOR_ACTIVE if right_hand_active else COLOR_LOCKED
+            c_bar = COLOR_LOCKED # Default color since pinch is removed
             cv2.rectangle(img, (bar_x, bar_y_start), (bar_x + 20, bar_y_end), (40, 40, 40), 2)
             cv2.rectangle(img, (bar_x, int(vol_bar_h)), (bar_x + 20, bar_y_end), c_bar, cv2.FILLED)
             img = draw_text_pil(img, f'{int(current_vol)}%', (bar_x - 5, bar_y_end + 10), size=16, color=c_bar)
             
             # Visual Feedback
-            if found_left: 
-                cv2.circle(img, (60, HEIGHT-60), 30, COLOR_ACCENT, -1)
-                img = draw_text_pil(img, "L", (52, HEIGHT-72), size=24, color=(0,0,0))
+            # REMOVED: Left Hand Feedback
             if found_right:
-                col = COLOR_ACTIVE if right_hand_active else (100, 127, 127)
+                col = COLOR_ACTIVE # Always active if found
                 cv2.circle(img, (WIDTH-60, HEIGHT-60), 30, col, -1)
                 img = draw_text_pil(img, "R", (WIDTH-68, HEIGHT-72), size=24, color=(0,0,0))
 
@@ -562,7 +774,7 @@ def main():
             elapsed = current_time - reg_start_time
             remaining = int(reg_countdown_duration - elapsed)
             
-            # Draw Frame normally so user sees themselves
+            # Draw Frame
             img = draw_text_pil(img, f"CAPTURING IN {remaining+1}...", (WIDTH//2 - 150, HEIGHT//2), size=50, color=COLOR_ACCENT)
             
             if remaining < 0:
@@ -616,7 +828,7 @@ def main():
             if key == 13: # Enter
                 if len(input_name_buffer) > 0:
                     print(f"Registering: {input_name_buffer}")
-                    # Ensure we have a valid capture
+                    # Ensure there is a valid capture
                     if reg_img_capture is not None:
                         face_auth.register_new_user(reg_img_capture, input_name_buffer)
                         face_auth.load()
@@ -631,7 +843,7 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     spotify_worker.stop()
-    emotion_thread.stop()
+    # emotion_thread.stop()
     voice_thread.stop()
     print("System Shutdown.")
 

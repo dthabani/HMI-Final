@@ -1,5 +1,7 @@
 *
 !.gitignore
+!emotion_manager.py
 !face_auth.py
+!gemini_parser.py
 !main.py
 !spotify_controller.py
